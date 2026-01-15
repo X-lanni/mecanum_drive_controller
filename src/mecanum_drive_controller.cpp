@@ -354,35 +354,52 @@ controller_interface::return_type MecanumDriveController::update_and_write_comma
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
   // FORWARD KINEMATICS (odometry).
+  // ==================== 1. 正运动学（FK）：轮速 -> 里程计 ====================
+  // 从 hardware_interface::state_interface 读取 4 个轮子的“实际角速度”（rad/s）
   const double wheel_front_left_state_vel = state_interfaces_[FRONT_LEFT].get_value();
   const double wheel_front_right_state_vel = state_interfaces_[FRONT_RIGHT].get_value();
   const double wheel_rear_right_state_vel = state_interfaces_[REAR_RIGHT].get_value();
   const double wheel_rear_left_state_vel = state_interfaces_[REAR_LEFT].get_value();
 
+  // 确保 4 个轮速都是有效值（不是 NaN），否则跳过里程计更新
   if (
     !std::isnan(wheel_front_left_state_vel) && !std::isnan(wheel_rear_left_state_vel) &&
     !std::isnan(wheel_rear_right_state_vel) && !std::isnan(wheel_front_right_state_vel))
   {
     // Estimate twist (using joint information) and integrate
+    // 使用轮速进行正运动学计算，估计底盘速度 (vx, vy, wz)
+    // 并使用 period.seconds() 对速度进行积分，更新 x / y / yaw
     odometry_.update(
       wheel_front_left_state_vel, wheel_rear_left_state_vel, wheel_rear_right_state_vel,
       wheel_front_right_state_vel, period.seconds());
   }
 
+  // ==================== 2. 读取 cmd_vel（reference）并计算“指令年龄” ====================
+  // 从实时缓冲区中读取最新的速度指令（~/reference 或 cmd_vel
   auto current_ref = *(input_ref_.readFromRT());
+  // 计算当前时间与指令时间戳的差值，用于 timeout 判断
   const auto age_of_last_command = time - (current_ref)->header.stamp;
 
   // send message only if there is no timeout
+  // ==================== 3. reference_timeout 逻辑（非常关键） ====================
+  // 当指令未超时，或 timeout 被设置为 0（特殊语义）
   if (age_of_last_command <= ref_timeout_ || ref_timeout_ == rclcpp::Duration::from_seconds(0))
   {
+    // 确保指令内容本身是合法数值
     if (
       !std::isnan(current_ref->twist.linear.x) && !std::isnan(current_ref->twist.linear.y) &&
       !std::isnan(current_ref->twist.angular.z))
     {
+      // 将 cmd_vel 中的 vx / vy / wz
+      // 写入 controller 内部的 reference_interfaces_
+      // 这是后续逆运动学（IK）的输入
       reference_interfaces_[0] = current_ref->twist.linear.x;
       reference_interfaces_[1] = current_ref->twist.linear.y;
       reference_interfaces_[2] = current_ref->twist.angular.z;
 
+      // 如果 reference_timeout == 0
+      // 语义是：该指令“只在本次 update 有效”
+      // update 结束后立刻清空 reference
       if (ref_timeout_ == rclcpp::Duration::from_seconds(0))
       {
         current_ref->twist.linear.x = std::numeric_limits<double>::quiet_NaN();
@@ -393,6 +410,8 @@ controller_interface::return_type MecanumDriveController::update_and_write_comma
   }
   else
   {
+    // ==================== 4. 指令超时：进入安全停机逻辑 ====================
+    // 如果 cmd_vel 超时，直接将期望速度置 0
     if (
       !std::isnan(current_ref->twist.linear.x) && !std::isnan(current_ref->twist.linear.y) &&
       !std::isnan(current_ref->twist.angular.z))
@@ -401,6 +420,7 @@ controller_interface::return_type MecanumDriveController::update_and_write_comma
       reference_interfaces_[1] = 0.0;
       reference_interfaces_[2] = 0.0;
 
+      // 同时清空 reference，避免重复使用过期指令
       current_ref->twist.linear.x = std::numeric_limits<double>::quiet_NaN();
       current_ref->twist.linear.y = std::numeric_limits<double>::quiet_NaN();
       current_ref->twist.angular.z = std::numeric_limits<double>::quiet_NaN();
@@ -410,10 +430,13 @@ controller_interface::return_type MecanumDriveController::update_and_write_comma
   // INVERSE KINEMATICS (move robot).
   // Compute wheels velocities (this is the actual ik):
   // NOTE: the input desired twist (from topic `~/reference`) is a body twist.
+  // ==================== 5. 逆运动学（IK）：底盘速度 -> 轮速 ====================
+  // 只有当 reference_interfaces_ 中 3 个分量都有效时才计算 IK
   if (
     !std::isnan(reference_interfaces_[0]) && !std::isnan(reference_interfaces_[1]) &&
     !std::isnan(reference_interfaces_[2]))
   {
+    // 构造 base_frame_offset.theta 的旋转（修正 base_link 与真实运动中心的偏差）
     tf2::Quaternion quaternion;
     quaternion.setRPY(0.0, 0.0, params_.kinematics.base_frame_offset.theta);
     /// \note The variables meaning:
@@ -422,13 +445,23 @@ controller_interface::return_type MecanumDriveController::update_and_write_comma
     /// linear_trans_from_base_to_center: offset/linear transformation matrix, to
     /// transform from base frame to center frame
 
+    /// rotation_from_base_to_center:
+    ///   从 base_link 坐标系 -> 运动中心坐标系的旋转矩阵
+    /// linear_trans_from_base_to_center:
+    ///   base_link 到运动中心的平移偏移量
+
     tf2::Matrix3x3 rotation_from_base_to_center = tf2::Matrix3x3((quaternion));
+
+    // 将期望速度从 base_link 坐标系旋转到运动中心坐标系
     tf2::Vector3 velocity_in_base_frame_w_r_t_center_frame_ =
       rotation_from_base_to_center *
       tf2::Vector3(reference_interfaces_[0], reference_interfaces_[1], 0.0);
+
+    // base_link 到运动中心的平移向量
     tf2::Vector3 linear_trans_from_base_to_center = tf2::Vector3(
       params_.kinematics.base_frame_offset.x, params_.kinematics.base_frame_offset.y, 0.0);
 
+    // 考虑角速度 wz 对线速度的附加项（刚体运动学）
     velocity_in_center_frame_linear_x_ =
       velocity_in_base_frame_w_r_t_center_frame_.x() +
       linear_trans_from_base_to_center.y() * reference_interfaces_[2];
@@ -437,6 +470,8 @@ controller_interface::return_type MecanumDriveController::update_and_write_comma
       linear_trans_from_base_to_center.x() * reference_interfaces_[2];
     velocity_in_center_frame_angular_z_ = reference_interfaces_[2];
 
+    // ==================== 6. 麦轮逆运动学公式 ====================
+    // 根据 mecanum 轮模型计算 4 个轮子的角速度（rad/s）
     const double wheel_front_left_vel =
       1.0 / params_.kinematics.wheels_radius *
       (velocity_in_center_frame_linear_x_ - velocity_in_center_frame_linear_y_ -
@@ -460,6 +495,8 @@ controller_interface::return_type MecanumDriveController::update_and_write_comma
 
     // Set wheels velocities - The joint names are sorted according to the order documented in the
     // header file!
+    // ==================== 7. 写入 command_interface（写给硬件） ====================
+    // 注意：这里没有任何限频，执行频率 = controller_manager update_rate
     command_interfaces_[FRONT_LEFT].set_value(wheel_front_left_vel);
     command_interfaces_[FRONT_RIGHT].set_value(wheel_front_right_vel);
     command_interfaces_[REAR_RIGHT].set_value(wheel_rear_right_vel);
@@ -467,6 +504,7 @@ controller_interface::return_type MecanumDriveController::update_and_write_comma
   }
   else
   {
+    // reference 无效时，直接给所有轮子下发 0 速度
     command_interfaces_[FRONT_LEFT].set_value(0.0);
     command_interfaces_[FRONT_RIGHT].set_value(0.0);
     command_interfaces_[REAR_RIGHT].set_value(0.0);
@@ -475,6 +513,7 @@ controller_interface::return_type MecanumDriveController::update_and_write_comma
 
   // Publish odometry message
   // Compute and store orientation info
+  // ==================== 8. 发布里程计 odom ====================
   tf2::Quaternion orientation;
   orientation.setRPY(0.0, 0.0, odometry_.getRz());
 
@@ -492,6 +531,7 @@ controller_interface::return_type MecanumDriveController::update_and_write_comma
   }
 
   // Publish tf /odom frame
+  // ==================== 9. 发布 odom -> base_link TF ====================
   if (params_.enable_odom_tf && rt_tf_odom_state_publisher_->trylock())
   {
     rt_tf_odom_state_publisher_->msg_.transforms.front().header.stamp = time;
@@ -502,6 +542,7 @@ controller_interface::return_type MecanumDriveController::update_and_write_comma
     rt_tf_odom_state_publisher_->unlockAndPublish();
   }
 
+  // ==================== 10. 发布 controller 内部状态（调试用） ====================
   if (controller_state_publisher_->trylock())
   {
     controller_state_publisher_->msg_.header.stamp = get_node()->now();
@@ -519,6 +560,7 @@ controller_interface::return_type MecanumDriveController::update_and_write_comma
     controller_state_publisher_->unlockAndPublish();
   }
 
+  // ==================== 11. 清空 reference（下一周期必须重新收到 cmd_vel） ====================
   reference_interfaces_[0] = std::numeric_limits<double>::quiet_NaN();
   reference_interfaces_[1] = std::numeric_limits<double>::quiet_NaN();
   reference_interfaces_[2] = std::numeric_limits<double>::quiet_NaN();
